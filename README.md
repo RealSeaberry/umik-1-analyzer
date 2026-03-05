@@ -44,7 +44,7 @@
 
 ### Pre-compiled Standalone Executable (Windows)
 The easiest way to use the analyzer without installing Python or dependencies is to download the bundled application:
-1. Navigate to the [Releases](#) tab on this GitHub repository.
+1. Navigate to the [Releases]([#](https://github.com/RealSeaberry/umik-1-analyzer/releases)) tab on this GitHub repository.
 2. Download the latest `UMIK_1_Spectrum_Analyzer.zip` from the `dist/` release assets.
 3. Extract the folder and run `UMIK_1_Spectrum_Analyzer.exe`. No installation required!
 
@@ -61,7 +61,7 @@ conda activate umik_pack
 pip install numpy scipy sounddevice pyqt5 pyqtgraph
 
 # 3. Clone this repository
-git clone https://github.com/your-username/umik-1-analyzer.git
+git clone https://github.com/RealSeaberry/umik-1-analyzer.git
 cd umik-1-analyzer
 ```
 
