@@ -21,7 +21,7 @@
 
 **Offline Data Viewer** — SPL time-series playback with spectrum snapshot at cursor and statistical summary table:
 
-![UMIK-1 Data Viewer](docs/screenshot_viewer.jpg)
+![UMIK-1 Data Viewer](docs/screenshot_viewer.png)
 
 ---
 
