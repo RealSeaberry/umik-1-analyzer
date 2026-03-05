@@ -1,0 +1,15 @@
+{
+    "fft": "32768",
+    "win": "blackman-harris",
+    "dc": true,
+    "maxhold": true,
+    "smooth": 5,
+    "wfspeed": 10,
+    "peaks": 5,
+    "primary_spl": 0,
+    "alarm": true,
+    "alarm_type": 0,
+    "alarm_thresh": 80,
+    "buzzer": true,
+    "cal_file": "D:/script/FFT/calibration/7189949.txt"
+}
