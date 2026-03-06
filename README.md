@@ -4,7 +4,7 @@
 ![Python Version](https://img.shields.io/badge/python-3.10%2B-brightgreen.svg)
 ![PyQtGraph](https://img.shields.io/badge/GUI-PyQtGraph-orange.svg)
 
-**UMIK-1 Spectrum Analyzer** is a high-performance, real-time audio spectrum analysis software developed in Python. It is specifically tailored for hardware like the **miniDSP UMIK-1** calibrated measurement microphone, bringing enterprise-level acoustic engineering capabilities directly to your desktop.
+**UMIK-1 Spectrum Analyzer** is a high-performance, real-time audio spectrum analysis software developed in Python. It is specifically tailored for **miniDSP UMIK-1** calibrated measurement microphone, bringing high-level acoustic engineering capabilities directly to your desktop.
 
 
 > [!WARNING]
