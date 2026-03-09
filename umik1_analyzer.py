@@ -1,10 +1,20 @@
 import sys
+import time
+import threading
+from collections import deque
 import numpy as np
 import sounddevice as sd
+if sys.platform == 'win32':
+    try:
+        import winsound as _winsound
+    except ImportError:
+        _winsound = None
+else:
+    _winsound = None
 from scipy.interpolate import interp1d
 from scipy.signal import find_peaks
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QComboBox, QCheckBox, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QComboBox, QCheckBox,
                              QSlider, QGroupBox, QFormLayout, QPushButton, QFileDialog, QSpinBox)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QEvent
 import pyqtgraph as pg
@@ -132,7 +142,7 @@ class AudioEngine(QObject):
         self.smoothed_power = None
         
         # Async Processing State
-        self.audio_queue = []
+        self.audio_queue = deque()
         self.audio_buffer = np.zeros(self.block_size)
         self.process_timer = QTimer()
         self.process_timer.timeout.connect(self.process_queue)
@@ -188,7 +198,7 @@ class AudioEngine(QObject):
     def set_block_size(self, size):
         self.block_size = size
         self.smoothed_power = None
-        self.audio_queue = []
+        self.audio_queue = deque()
         self.audio_buffer = np.zeros(self.block_size)
         self._update_internal_arrays()
         if self.stream is not None:
@@ -224,23 +234,33 @@ class AudioEngine(QObject):
 
     def audio_callback(self, indata, frames, time, status):
         try:
-            if status:
+            if status and 'input overflow' not in str(status):
                 print(f"Audio status: {status}")
-            
-            # Fast non-blocking queue push
-            # We copy because indata might be overwritten
+            # Fast non-blocking queue push; indata may be overwritten after return
             self.audio_queue.append(indata[:, 0].copy())
         except Exception as e:
             print(f"Exception in audio_callback: {e}")
 
     def process_queue(self):
+        # Stream watchdog: restart if the stream has died silently
+        if self.stream is not None and not self.stream.active:
+            now = time.time()
+            if now - getattr(self, '_last_watchdog_restart', 0) > 5.0:
+                self._last_watchdog_restart = now
+                print("[Watchdog] Audio stream inactive — restarting...")
+                try:
+                    self.restart_stream()
+                except Exception as e:
+                    print(f"[Watchdog] Restart failed: {e}")
+                return
+
         if not self.audio_queue:
             return
             
         # Drain the current queue and concatenate
         chunks = []
         while self.audio_queue:
-            chunks.append(self.audio_queue.pop(0))
+            chunks.append(self.audio_queue.popleft())
         new_data = np.concatenate(chunks)
         
         # If queue accumulated more than our window size, truncate to newest data
@@ -317,7 +337,8 @@ class AudioEngine(QObject):
                 device=self.device_id,
                 samplerate=self.sample_rate,
                 channels=1,
-                blocksize=min(4096, self.block_size), 
+                blocksize=min(4096, self.block_size),
+                latency='high',
                 callback=self.audio_callback
             )
             self.stream.start()
@@ -468,6 +489,10 @@ class MainWindow(QMainWindow):
         # Band Selection Region
         self.region = pg.LinearRegionItem([np.log10(2.0), np.log10(10.0)])
         self.region.setZValue(10)
+        # Make boundary handles thicker so they are easier to grab
+        for _line in self.region.lines:
+            _line.setPen(pg.mkPen('#FFC107', width=3))
+            _line.setHoverPen(pg.mkPen('white', width=6))
         self.pw_spectrum.addItem(self.region)
         self.region.sigRegionChanged.connect(self.update_band_selection)
         
@@ -678,6 +703,26 @@ class MainWindow(QMainWindow):
         self.chk_buzzer = QCheckBox("Sound Buzzer (Warning)")
         form_dsp.addRow("", self.chk_buzzer)
         
+        self.chk_alarm_rec = QCheckBox("Auto-Record on Alarm")
+        self.chk_alarm_rec.setToolTip("Automatically start recording when alarm triggers. Stops 30s after alarm clears.")
+        
+        self.btn_alarm_rec_dir = QPushButton("Browse...")
+        self.btn_alarm_rec_dir.setFixedWidth(120)
+        self.btn_alarm_rec_dir.setStyleSheet("background-color: #444; color: white; padding: 3px;")
+        self.btn_alarm_rec_dir.clicked.connect(self.pick_alarm_rec_dir)
+        
+        alarm_rec_row = QHBoxLayout()
+        alarm_rec_row.addWidget(self.chk_alarm_rec)
+        alarm_rec_row.addWidget(self.btn_alarm_rec_dir)
+        alarm_rec_widget = QWidget()
+        alarm_rec_widget.setLayout(alarm_rec_row)
+        form_dsp.addRow("", alarm_rec_widget)
+        
+        self.lbl_alarm_rec_dir = QLabel("d:\\script\\FFT\\record")
+        self.lbl_alarm_rec_dir.setStyleSheet("color: #888; font-size: 12px;")
+        self.lbl_alarm_rec_dir.setWordWrap(True)
+        form_dsp.addRow("Save to:", self.lbl_alarm_rec_dir)
+        
         # User requested to link waterfall scales to spectrum height, 
         # so manual sliders were removed.
         
@@ -717,21 +762,14 @@ class MainWindow(QMainWindow):
         # Connect signals
         self.engine.data_ready.connect(self.on_data_ready)
         
-        # Sync initial UI states
-        self.engine.set_block_size(int(self.combo_fft.currentText()))
-        self.engine.set_window(self.combo_win.currentText())
-        self.engine.subtract_dc = self.chk_dc.isChecked()
-        self.engine.smoothing_factor = self.slider_smooth.value() / 100.0
+        # Auto-record alarm state
+        self.alarm_last_triggered_time = None
+        self._alarm_rec_started = False
+        self.alarm_rec_dir = "d:\\script\\FFT\\record"
         
-        # Also auto-load user's calibration if available in specific path
-        success, msg = self.engine.parse_calibration(r'd:\script\FFT\calibration\7189949_90deg.txt')
-        if success:
-            self.lbl_cal_status.setText(msg)
-            self.lbl_cal_status.setStyleSheet("color: #4CAF50;")
-            
-        # Load user saved settings if available
+        # Load all settings (includes calibration with hardcoded fallback)
         self.load_settings()
-        
+
         # Start
         self.engine.start_stream()
 
@@ -885,8 +923,10 @@ class MainWindow(QMainWindow):
                 self.lbl_cal_status.setStyleSheet("color: #F44336;")
 
     def update_band_selection(self):
+        if self.engine is None:
+            return
         minX, maxX = self.region.getRegion()
-        
+
         # Snap logic if octave is checked
         if self.btn_octave.isChecked() and hasattr(self.engine, 'oct_lower'):
             act_min = 10**minX
@@ -948,62 +988,172 @@ class MainWindow(QMainWindow):
     def load_settings(self):
         import json, os
         conf_path = "d:\\script\\FFT\\settings.json"
+        data = {}
         if os.path.exists(conf_path):
             try:
                 with open(conf_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                
-                if 'fft' in data: self.combo_fft.setCurrentText(str(data['fft']))
-                if 'win' in data: self.combo_win.setCurrentText(str(data['win']))
-                if 'dc' in data: self.chk_dc.setChecked(bool(data['dc']))
-                if 'maxhold' in data: self.chk_maxhold.setChecked(bool(data['maxhold']))
-                if 'smooth' in data: self.slider_smooth.setValue(int(data['smooth']))
-                if 'wfspeed' in data: self.slider_wf_speed.setValue(int(data['wfspeed']))
-                if 'peaks' in data: self.spin_peaks.setValue(int(data['peaks']))
-                if 'primary_spl' in data: self.combo_primary.setCurrentIndex(int(data['primary_spl']))
-                if 'alarm' in data: self.chk_alarm.setChecked(bool(data['alarm']))
-                if 'alarm_type' in data: self.combo_alarm_type.setCurrentIndex(int(data['alarm_type']))
-                if 'alarm_thresh' in data: self.spin_alarm_thresh.setValue(int(data['alarm_thresh']))
-                if 'buzzer' in data: self.chk_buzzer.setChecked(bool(data['buzzer']))
-                if 'cal_file' in data and os.path.exists(data['cal_file']):
-                    success, msg = self.engine.parse_calibration(data['cal_file'])
-                    self.lbl_cal_status.setText(msg)
-                    if success: self.lbl_cal_status.setStyleSheet("color: #4CAF50;")
+                print(f"[Settings] Loaded from {conf_path}")
             except Exception as e:
-                print(f"Error loading settings: {e}")
+                print(f"[Settings] Error reading file: {e}")
+        else:
+            print("[Settings] No settings file found — using defaults, will create on close.")
+
+        # ---- Apply UI widget values (block signals to avoid duplicate engine calls) ----
+        def _set_combo(combo, key, default):
+            combo.blockSignals(True)
+            combo.setCurrentText(str(data.get(key, default)))
+            combo.blockSignals(False)
+
+        def _set_spin(spin, key, default):
+            spin.blockSignals(True)
+            spin.setValue(int(data.get(key, default)))
+            spin.blockSignals(False)
+
+        def _set_check(chk, key, default):
+            chk.blockSignals(True)
+            chk.setChecked(bool(data.get(key, default)))
+            chk.blockSignals(False)
+
+        def _set_slider(slider, key, default):
+            slider.blockSignals(True)
+            slider.setValue(int(data.get(key, default)))
+            slider.blockSignals(False)
+
+        _set_combo(self.combo_fft,  'fft', '65536')
+        _set_combo(self.combo_win,  'win', 'blackman-harris')
+        _set_check(self.chk_dc,     'dc',  True)
+        _set_check(self.chk_maxhold,'maxhold', True)
+        _set_slider(self.slider_smooth,   'smooth',  80)
+        _set_slider(self.slider_wf_speed, 'wfspeed', 10)
+        _set_spin(self.spin_peaks,        'peaks',   3)
+
+        self.combo_primary.blockSignals(True)
+        self.combo_primary.setCurrentIndex(int(data.get('primary_spl', 0)))
+        self.combo_primary.blockSignals(False)
+
+        _set_check(self.chk_alarm,    'alarm',    False)
+        self.combo_alarm_type.blockSignals(True)
+        self.combo_alarm_type.setCurrentIndex(int(data.get('alarm_type', 0)))
+        self.combo_alarm_type.blockSignals(False)
+        _set_spin(self.spin_alarm_thresh, 'alarm_thresh', 85)
+        _set_check(self.chk_buzzer,   'buzzer',   False)
+        _set_check(self.chk_alarm_rec,'alarm_rec',False)
+
+        if data.get('alarm_rec_dir'):
+            self.alarm_rec_dir = data['alarm_rec_dir']
+            self.lbl_alarm_rec_dir.setText(data['alarm_rec_dir'])
+
+        # Band region
+        band_region = data.get('band_region')
+        if band_region and len(band_region) == 2:
+            self.region.blockSignals(True)
+            self.region.setRegion(band_region)
+            self.region.blockSignals(False)
+
+        # Restore audio device by name
+        saved_device = data.get('device_name', '')
+        if saved_device:
+            for i in range(self.combo_device.count()):
+                if self.combo_device.itemText(i) == saved_device:
+                    self.combo_device.blockSignals(True)
+                    self.combo_device.setCurrentIndex(i)
+                    self.combo_device.blockSignals(False)
+                    self.engine.device_id = self.combo_device.itemData(i)
+                    break
+
+        # ---- Sync engine directly (one call each, no signal cascades) ----
+        self.engine.set_block_size(int(self.combo_fft.currentText()))
+        self.engine.set_window(self.combo_win.currentText())
+        self.engine.subtract_dc = self.chk_dc.isChecked()
+        self.engine.smoothing_factor = (100.0 - self.slider_smooth.value()) / 100.0
+        minX, maxX = self.region.getRegion()
+        self.engine.set_band(10 ** minX, 10 ** maxX)
+
+        # ---- Load calibration ----
+        cal_file = data.get('cal_file', '')
+        cal_loaded = False
+        if cal_file and os.path.exists(cal_file):
+            success, msg = self.engine.parse_calibration(cal_file)
+            print(f"[Settings] Calibration: {msg}")
+            self.lbl_cal_status.setText(msg)
+            if success:
+                self.lbl_cal_status.setStyleSheet("color: #4CAF50;")
+                cal_loaded = True
+            else:
+                self.lbl_cal_status.setStyleSheet("color: #F44336;")
+
+        if not cal_loaded:
+            # Fallback: try the standard local calibration file
+            default_cal = r'd:\script\FFT\calibration\7189949_90deg.txt'
+            if os.path.exists(default_cal):
+                success, msg = self.engine.parse_calibration(default_cal)
+                print(f"[Settings] Calibration (fallback): {msg}")
+                if success:
+                    self.lbl_cal_status.setText(msg)
+                    self.lbl_cal_status.setStyleSheet("color: #4CAF50;")
+
+        print(f"[Settings] Engine state — FFT={self.engine.block_size}, "
+              f"win={self.engine.window_type}, smooth={self.engine.smoothing_factor:.3f}, "
+              f"dc={self.engine.subtract_dc}")
+
+        # ---- Restore spectrum view range ----
+        view_x = data.get('view_x')
+        view_y = data.get('view_y')
+        if view_x and len(view_x) == 2:
+            self.pw_spectrum.setXRange(view_x[0], view_x[1], padding=0)
+        if view_y and len(view_y) == 2:
+            self.pw_spectrum.setYRange(view_y[0], view_y[1], padding=0)
 
     def save_settings(self):
-        import json
+        import json, os
         conf_path = "d:\\script\\FFT\\settings.json"
         try:
+            os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+            band_region = list(self.region.getRegion())
             data = {
-                'fft': self.combo_fft.currentText(),
-                'win': self.combo_win.currentText(),
-                'dc': self.chk_dc.isChecked(),
-                'maxhold': self.chk_maxhold.isChecked(),
-                'smooth': self.slider_smooth.value(),
-                'wfspeed': self.slider_wf_speed.value(),
-                'peaks': self.spin_peaks.value(),
-                'primary_spl': self.combo_primary.currentIndex(),
-                'alarm': self.chk_alarm.isChecked(),
-                'alarm_type': self.combo_alarm_type.currentIndex(),
+                'fft':          self.combo_fft.currentText(),
+                'win':          self.combo_win.currentText(),
+                'dc':           self.chk_dc.isChecked(),
+                'maxhold':      self.chk_maxhold.isChecked(),
+                'smooth':       self.slider_smooth.value(),
+                'wfspeed':      self.slider_wf_speed.value(),
+                'peaks':        self.spin_peaks.value(),
+                'primary_spl':  self.combo_primary.currentIndex(),
+                'alarm':        self.chk_alarm.isChecked(),
+                'alarm_type':   self.combo_alarm_type.currentIndex(),
                 'alarm_thresh': self.spin_alarm_thresh.value(),
-                'buzzer': self.chk_buzzer.isChecked(),
-                'cal_file': self.engine.cal_file if self.engine else ""
+                'buzzer':       self.chk_buzzer.isChecked(),
+                'alarm_rec':    self.chk_alarm_rec.isChecked(),
+                'alarm_rec_dir':self.alarm_rec_dir,
+                'cal_file':     self.engine.cal_file if self.engine else "",
+                'band_region':  band_region,
+                'device_name':  self.combo_device.currentText(),
             }
+            try:
+                vb = self.pw_spectrum.getViewBox()
+                rng = vb.viewRange()
+                data['view_x'] = rng[0]
+                data['view_y'] = rng[1]
+            except Exception:
+                pass
             with open(conf_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4)
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            print(f"[Settings] Saved to {conf_path}")
         except Exception as e:
-            print(f"Error saving settings: {e}")
+            print(f"[Settings] Error saving: {e}")
 
     def closeEvent(self, event):
         self.save_settings()
+        if self.is_recording:
+            self.stop_and_save_recording(blocking=True)
+        elif hasattr(self, '_save_thread') and self._save_thread.is_alive():
+            self._save_thread.join(timeout=60)
         if self.engine:
             self.engine.stop_stream()
         super().closeEvent(event)
             
     def toggle_recording(self):
-        import time
         should_record = self.btn_record.isChecked()
         if should_record:
             filepath, _ = QFileDialog.getSaveFileName(self, "Save Data Package", "d:\\script\\FFT\\record", "NPZ Archive (*.npz)")
@@ -1034,30 +1184,71 @@ class MainWindow(QMainWindow):
         else:
             self.stop_and_save_recording()
             
-    def stop_and_save_recording(self):
+    def stop_and_save_recording(self, blocking=False):
         self.is_recording = False
         self.btn_record.setChecked(False)
         self.spin_record_time.setEnabled(True)
         self.btn_record.setText("⏺ 开始记录" if self.current_lang == 'ZH' else "⏺ Start Recording")
         self.btn_record.setStyleSheet("background-color: #4CAF50; color: white; padding: 5px; font-weight: bold;")
-        
-        # Save to NPZ
-        if self.record_data_dict and len(self.record_data_dict['timestamps']) > 0:
+
+        # Grab data immediately and clear shared dict so recording can restart
+        data_to_save = self.record_data_dict
+        filepath = getattr(self, 'record_filepath', None)
+        self.record_data_dict = {}
+
+        if not data_to_save or not filepath or len(data_to_save.get('timestamps', [])) == 0:
+            return
+
+        def _do_save():
             try:
                 np.savez_compressed(
-                    self.record_filepath,
-                    timestamps=np.array(self.record_data_dict['timestamps']),
-                    lz=np.array(self.record_data_dict['lz']),
-                    la=np.array(self.record_data_dict['la']),
-                    lc=np.array(self.record_data_dict['lc']),
-                    band=np.array(self.record_data_dict['band']),
-                    freqs=self.record_data_dict['freqs'],
-                    spectra=np.array(self.record_data_dict['spectra'])
+                    filepath,
+                    timestamps=np.array(data_to_save['timestamps']),
+                    lz=np.array(data_to_save['lz']),
+                    la=np.array(data_to_save['la']),
+                    lc=np.array(data_to_save['lc']),
+                    band=np.array(data_to_save['band']),
+                    freqs=data_to_save['freqs'],
+                    spectra=np.array(data_to_save['spectra'])
                 )
-                print(f"Saved recording to {self.record_filepath}")
+                print(f"Saved recording to {filepath}")
             except Exception as e:
                 print(f"Error saving NPZ record: {e}")
-            self.record_data_dict = {}
+
+        t = threading.Thread(target=_do_save, daemon=True)
+        t.start()
+        self._save_thread = t
+        if blocking:
+            t.join(timeout=60)
+            
+    def pick_alarm_rec_dir(self):
+        from PyQt5.QtWidgets import QFileDialog
+        folder = QFileDialog.getExistingDirectory(self, "Select Alarm Recording Folder", self.alarm_rec_dir)
+        if folder:
+            self.alarm_rec_dir = folder
+            self.lbl_alarm_rec_dir.setText(folder)
+            
+    def start_alarm_recording(self):
+        """Auto-trigger recording when alarm fires. Uses an auto-timestamped path."""
+        import os
+        os.makedirs(self.alarm_rec_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(self.alarm_rec_dir, f"alarm_{ts}.npz")
+        self.record_filepath = filepath
+        self.record_data_dict = {
+            'timestamps': [],
+            'lz': [], 'la': [], 'lc': [], 'band': [],
+            'freqs': None,
+            'spectra': []
+        }
+        self.record_start_time = time.time()
+        self.record_duration = 0  # No manual cap — controlled by alarm state machine
+        self.spin_record_time.setEnabled(False)
+        self.btn_record.setChecked(True)
+        self.btn_record.setText("⏹ 报警录制中..." if self.current_lang == 'ZH' else "⏹ Alarm Recording...")
+        self.btn_record.setStyleSheet("background-color: #E65100; color: white; padding: 5px; font-weight: bold;")
+        self.is_recording = True
+        print(f"[Auto-Record] Alarm triggered — recording started: {filepath}")
             
     def on_plot_clicked(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1151,7 +1342,6 @@ class MainWindow(QMainWindow):
             # Record Data
             if self.is_recording:
                 try:
-                    import time
                     current_time = time.time()
                     elapsed = current_time - self.record_start_time
                     
@@ -1252,16 +1442,35 @@ class MainWindow(QMainWindow):
 
                 if val_alarm >= thresh:
                     target_label.setStyleSheet("font-family: 'Courier New', monospace; font-size: 24px; font-weight: bold; color: white; background-color: #D32F2F; border: 2px solid red; border-radius: 5px; padding: 10px;")
-                    if self.chk_buzzer.isChecked() and sys.platform == 'win32':
-                        import threading
-                        import winsound
-                        # Play short beep asynchronously
-                        threading.Thread(target=lambda: winsound.Beep(2000, 200), daemon=True).start()
+                    if self.chk_buzzer.isChecked() and _winsound is not None:
+                        now = time.time()
+                        if now - getattr(self, '_last_beep_time', 0) >= 0.4:
+                            self._last_beep_time = now
+                            threading.Thread(
+                                target=lambda: _winsound.Beep(2000, 200),
+                                daemon=True).start()
+                    
+                    # Auto-record state machine: alarm active
+                    if self.chk_alarm_rec.isChecked():
+                        self.alarm_last_triggered_time = time.time()
+                        if not self.is_recording and not getattr(self, '_alarm_rec_started', False):
+                            self._alarm_rec_started = True
+                            self.start_alarm_recording()
                 else:
                     if target_label == self.lbl_band:
                         target_label.setStyleSheet("font-family: 'Courier New', monospace; font-size: 24px; font-weight: bold; color: #FFC107; background-color: #111; border: 2px solid #333; border-radius: 5px; padding: 10px;")
                     else:
                         target_label.setStyleSheet("font-family: 'Courier New', monospace; font-size: 28px; font-weight: bold; color: #00FF00; background-color: #111; border: 2px solid #333; border-radius: 5px; padding: 10px;")
+                    
+                    # Auto-record state machine: alarm cleared — wait 30s then stop
+                    if self.chk_alarm_rec.isChecked() and getattr(self, '_alarm_rec_started', False):
+                        if self.alarm_last_triggered_time is not None:
+                            post_alarm_elapsed = time.time() - self.alarm_last_triggered_time
+                            if post_alarm_elapsed >= 30.0:
+                                self._alarm_rec_started = False
+                                self.alarm_last_triggered_time = None
+                                if self.is_recording:
+                                    self.stop_and_save_recording()
             else:
                 self.lbl_band.setStyleSheet("font-family: 'Courier New', monospace; font-size: 24px; font-weight: bold; color: #FFC107; background-color: #111; border: 2px solid #333; border-radius: 5px; padding: 10px;")
                 self.lbl_lz.setStyleSheet("font-family: 'Courier New', monospace; font-size: 28px; font-weight: bold; color: #00FF00; background-color: #111; border: 2px solid #333; border-radius: 5px; padding: 10px;")
@@ -1331,8 +1540,7 @@ def main():
     try:
         from PyQt5.QtGui import QPixmap, QPainter, QFont, QColor
         from PyQt5.QtWidgets import QSplashScreen
-        import time
-        
+
         app = QApplication(sys.argv)
         app.setStyle("Fusion")
         

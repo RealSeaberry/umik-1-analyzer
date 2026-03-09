@@ -1,10 +1,27 @@
 import sys
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+from scipy.interpolate import interp1d
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QSlider)
 from PyQt5.QtCore import Qt
 import datetime
+
+
+class LogFreqAxis(pg.AxisItem):
+    """Axis that displays log10 internal values as real Hz labels."""
+    def tickStrings(self, values, scale, spacing):
+        strings = []
+        for val in values:
+            try:
+                real_val = 10 ** val
+                if real_val >= 10:
+                    strings.append(f"{int(round(real_val))}")
+                else:
+                    strings.append(f"{real_val:.1f}")
+            except OverflowError:
+                strings.append("")
+        return strings
 
 class OffsetTimeAxisItem(pg.AxisItem):
     def __init__(self, *args, **kwargs):
@@ -77,7 +94,10 @@ class UmikDataViewer(QMainWindow):
         
         # Tab 1: Historical Waterfall Plot
         self.date_axis_wf = OffsetTimeAxisItem(orientation='bottom')
-        self.pw_waterfall = pg.PlotWidget(title="Full Waterfall (全量程瀑布图)", axisItems={'bottom': self.date_axis_wf})
+        self.log_freq_axis_wf = LogFreqAxis(orientation='left')
+        self.pw_waterfall = pg.PlotWidget(title="Full Waterfall (全量程瀑布图)",
+                                          axisItems={'bottom': self.date_axis_wf,
+                                                     'left': self.log_freq_axis_wf})
         self.pw_waterfall.setLabel('bottom', 'Local Time (本地时间)')
         self.pw_waterfall.setLabel('left', 'Frequency', units='Hz')
         self.pw_waterfall.setMouseEnabled(x=True, y=True)
@@ -85,16 +105,17 @@ class UmikDataViewer(QMainWindow):
         self.pw_waterfall.addItem(self.img_waterfall)
         colormap = pg.colormap.get('inferno')
         self.img_waterfall.setLookupTable(colormap.getLookupTable())
-        self.pw_waterfall.setXLink(self.pw_spl) # Link Time Axes
+        self.pw_waterfall.setXLink(self.pw_spl)  # Link Time Axes
         self.tabs.addTab(self.pw_waterfall, "Waterfall 瀑布图")
         
         # Tab 2: Snapshot Spectrum Plot (Controlled by Time Marker)
         spec_tab_widget = QWidget()
         spec_layout = QVBoxLayout(spec_tab_widget)
         
-        self.pw_spec = pg.PlotWidget(title="Spectrum Snapshot at Cursor (游标处截面频谱)")
+        self.pw_spec = pg.PlotWidget(title="Spectrum Snapshot at Cursor (游标处截面频谱)",
+                                     axisItems={'bottom': LogFreqAxis(orientation='bottom')})
         self.pw_spec.showGrid(x=True, y=True, alpha=0.3)
-        self.pw_spec.setLabel('bottom', 'Frequency Log10', units='Hz')
+        self.pw_spec.setLabel('bottom', 'Frequency', units='Hz')
         self.pw_spec.setLabel('left', 'SPL', units='dB')
         self.pw_spec.setYRange(0, 130)
         self.curve_spec = self.pw_spec.plot(pen=pg.mkPen('cyan', width=1.5))
@@ -139,7 +160,7 @@ class UmikDataViewer(QMainWindow):
             self.pw_waterfall.setLabel('bottom', '本地时间')
             self.pw_waterfall.setLabel('left', '频率', units='Hz')
             self.pw_spec.setTitle("当前游标处截面频谱")
-            self.pw_spec.setLabel('bottom', '频率 (Log10)', units='Hz')
+            self.pw_spec.setLabel('bottom', '频率', units='Hz')
             self.pw_spec.setLabel('left', '声压级', units='dB')
             self.btn_load.setText("加载录音数据包...")
             self.btn_lang.setText("EN / ZH")
@@ -161,7 +182,7 @@ class UmikDataViewer(QMainWindow):
             self.pw_waterfall.setLabel('bottom', 'Local Time')
             self.pw_waterfall.setLabel('left', 'Frequency', units='Hz')
             self.pw_spec.setTitle("Spectrum Snapshot at Cursor")
-            self.pw_spec.setLabel('bottom', 'Frequency (Log10)', units='Hz')
+            self.pw_spec.setLabel('bottom', 'Frequency', units='Hz')
             self.pw_spec.setLabel('left', 'SPL', units='dB')
             self.btn_load.setText("Load Record Archive...")
             self.btn_lang.setText("EN / ZH")
@@ -213,26 +234,57 @@ class UmikDataViewer(QMainWindow):
             self.pw_spl.plot(timestamps, lc, pen=pg.mkPen('c', width=1.5), name="Total LCeq")
             self.pw_spl.plot(timestamps, band, pen=pg.mkPen('r', width=3), name="Band SPL")
             
-            # Plot Waterfall
-            # We transpose spectra because ImageItem expects (X, Y) which translates to (Time, Frequencies)
-            self.img_waterfall.setImage(spectra)
-            
-            # Setup image rect to map exactly to the Time and Freq bounds
-            log_f = np.log10(freqs[freqs > 0])
-            f_min = log_f[0] if len(log_f)>0 else 0
-            f_max = log_f[-1] if len(log_f)>0 else 1
-            t_start = timestamps[0] # Which is 0 now
+            # ---- Waterfall: remap linear-freq spectra to log-freq grid ----
+            valid_mask = freqs > 0
+            valid_freqs = freqs[valid_mask]
+            log_f_min = np.log10(valid_freqs[0])
+            log_f_max = np.log10(valid_freqs[-1])
+
+            # Build a log-spaced frequency grid (256 bins looks good)
+            N_LOG_BINS = 256
+            log_freq_grid = np.linspace(log_f_min, log_f_max, N_LOG_BINS)
+            actual_freq_grid = 10 ** log_freq_grid
+
+            # Remap each time frame from linear freq bins to log freq bins
+            n_frames = spectra.shape[0]
+            log_spectra = np.empty((n_frames, N_LOG_BINS), dtype=np.float32)
+            for i in range(n_frames):
+                row = spectra[i][valid_mask]
+                interp_fn = interp1d(valid_freqs, row, kind='linear',
+                                     bounds_error=False, fill_value=(row[0], row[-1]))
+                log_spectra[i] = interp_fn(actual_freq_grid)
+
+            # Downsample time axis for very long recordings (max 2000 columns)
+            MAX_TIME_COLS = 2000
+            if n_frames > MAX_TIME_COLS:
+                step = n_frames // MAX_TIME_COLS
+                disp_spectra = log_spectra[::step]
+                disp_timestamps = timestamps[::step]
+            else:
+                disp_spectra = log_spectra
+                disp_timestamps = timestamps
+
+            t_start = timestamps[0]   # = 0 after normalization
             t_max = timestamps[-1]
             t_duration = t_max - t_start
-            
-            # Scale rect (x, y, width, height)
-            self.img_waterfall.setRect(pg.QtCore.QRectF(t_start, f_min, t_duration, f_max - f_min))
-            self.img_waterfall.setLevels([np.min(spectra), np.max(spectra)])
-            self.pw_waterfall.setYRange(f_min, f_max)
+            disp_t_start = disp_timestamps[0]
+            disp_t_dur = disp_timestamps[-1] - disp_t_start
+
+            # ImageItem: shape (Time, Freq) → X=Time, Y=Freq
+            self.img_waterfall.setImage(disp_spectra)
+            self.img_waterfall.setRect(pg.QtCore.QRectF(
+                disp_t_start, log_f_min, disp_t_dur, log_f_max - log_f_min))
+            spl_min = float(np.percentile(log_spectra, 5))
+            spl_max = float(np.percentile(log_spectra, 99))
+            self.img_waterfall.setLevels([spl_min, spl_max])
+            self.pw_waterfall.setYRange(log_f_min, log_f_max)
             
             # Auto range
             self.pw_spl.setXRange(t_start, t_max)
             self.pw_spl.autoRange()
+
+            # Set spectrum snapshot X range to match frequency data
+            self.pw_spec.setXRange(log_f_min, log_f_max)
             
             # Populate Table
             metrics = [("Total LZeq", lz), ("Total LAeq", la), ("Total LCeq", lc), ("Target Band SPL", band)]
