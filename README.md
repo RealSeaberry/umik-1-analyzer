@@ -4,7 +4,7 @@
 ![Python Version](https://img.shields.io/badge/python-3.10%2B-brightgreen.svg)
 ![PyQtGraph](https://img.shields.io/badge/GUI-PyQtGraph-orange.svg)
 
-**UMIK-1 Spectrum Analyzer** is a high-performance, real-time audio spectrum analysis software developed in Python. It is specifically tailored for hardware like the **miniDSP UMIK-1** calibrated measurement microphone, bringing enterprise-level acoustic engineering capabilities directly to your desktop.
+**UMIK-1 Spectrum Analyzer** is a high-performance, real-time audio spectrum analysis software developed in Python. It is specifically tailored for **miniDSP UMIK-1** calibrated measurement microphone, bringing high-level acoustic engineering capabilities directly to your desktop.
 
 
 > [!WARNING]
@@ -21,7 +21,7 @@
 
 **Offline Data Viewer** — SPL time-series playback with spectrum snapshot at cursor and statistical summary table:
 
-![UMIK-1 Data Viewer](docs/screenshot_viewer.jpg)
+![UMIK-1 Data Viewer](docs/screenshot_viewer.png)
 
 ---
 
@@ -44,7 +44,7 @@
 
 ### Pre-compiled Standalone Executable (Windows)
 The easiest way to use the analyzer without installing Python or dependencies is to download the bundled application:
-1. Navigate to the [Releases](#) tab on this GitHub repository.
+1. Navigate to the [Releases](https://github.com/RealSeaberry/umik-1-analyzer/releases) tab on this GitHub repository.
 2. Download the latest `UMIK_1_Spectrum_Analyzer.zip` from the `dist/` release assets.
 3. Extract the folder and run `UMIK_1_Spectrum_Analyzer.exe`. No installation required!
 
@@ -61,7 +61,7 @@ conda activate umik_pack
 pip install numpy scipy sounddevice pyqt5 pyqtgraph
 
 # 3. Clone this repository
-git clone https://github.com/your-username/umik-1-analyzer.git
+git clone https://github.com/RealSeaberry/umik-1-analyzer.git
 cd umik-1-analyzer
 ```
 
